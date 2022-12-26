@@ -1,0 +1,7 @@
+.env
+.idea/
+bin/
+.DS_Store
+log.txt
+test/
+history/
