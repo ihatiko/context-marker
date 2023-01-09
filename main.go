@@ -2,12 +2,16 @@ package main
 
 import (
 	"fmt"
+	"github.com/samber/lo"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"log"
 	"os"
 	"path"
+	"reflect"
+	"sort"
+	"strings"
 )
 
 const template = "context.Context"
@@ -19,7 +23,7 @@ const appendContextTemplateWithComma = "\"context\""
 const comma byte = 44 // "," https://unicode-table.com/en/002C/
 const space byte = 32 // \s https://unicode-table.com/en/0020/
 func main() {
-	startFolder := "deep0"
+	startFolder := "test-data-implementation"
 	files, err := os.ReadDir(startFolder)
 	dirPath := startFolder
 	if err != nil {
@@ -30,8 +34,8 @@ func main() {
 			dirPath = path.Join(dirPath, file.Name())
 		}
 	}
+
 	processDir(startFolder)
-	//processFile("deep0/interface-case1.go")
 }
 
 func processDir(folder string) {
@@ -46,24 +50,79 @@ func processDir(folder string) {
 			processDir(filePath)
 			continue
 		}
+		markInterfaceRealization(folder, filePath)
 		processFile(folder, filePath)
 	}
 }
 
 type TokenInfo struct {
-	Start int
-	End   int
+	Start   int
+	End     int
+	Imports []string
 }
 
+// TODO в 2 фазы 1) вычитываем все файлы и собираем реализации по пакету (текущий уровень вложенности по путям)
+var InterfaceRealization = map[string][]string{}
+
+func markInterfaceRealization(fileFolder, file string) {
+	fSet := token.NewFileSet()
+	node, err := parser.ParseFile(fSet, file, nil, parser.ParseComments)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, decl := range node.Decls {
+		genDecl, ok := decl.(*ast.GenDecl)
+		var specs ast.Spec
+		if ok {
+			specs = genDecl.Specs[0]
+		} else {
+			genDecl, _ := decl.(*ast.FuncDecl)
+			if genDecl.Recv != nil {
+				_, ok := genDecl.Recv.List[0].Type.(*ast.Ident)
+				params := lo.Map[*ast.Field, string](genDecl.Type.Params.List, func(item *ast.Field, index int) string {
+					return item.Type.(*ast.Ident).Name
+				})
+				sort.Strings(params)
+				fnParams := strings.Join(params, ",")
+				if ok {
+					fmt.Println(fmt.Sprintf("%s(%s)", genDecl.Name, fnParams))
+				} else {
+					/*					starExpr, _ := genDecl.Recv.List[0].Type.(*ast.StarExpr)
+										astIdent := starExpr.X.(*ast.Ident)*/
+					fmt.Println(fmt.Sprintf("%s(%s)", genDecl.Name, fnParams))
+				}
+			}
+			continue
+		}
+
+		if genDecl.Tok == token.IMPORT {
+			continue
+		}
+		v := reflect.TypeOf(specs).Elem()
+		switch v.Name() {
+		case "ValueSpec":
+			typeSpec, _ := genDecl.Specs[0].(*ast.ValueSpec)
+			typeSpec = typeSpec
+			break
+		case "TypeSpec":
+			typeSpec, _ := genDecl.Specs[0].(*ast.TypeSpec)
+			typeSpec = typeSpec
+			break
+		default:
+			fmt.Println("unsupported type", v.Name())
+		}
+	}
+}
+
+// TODO stringBuilder
 func processFile(fileFolder, file string) {
 	tokenInfo := TokenInfo{}
 	needImport := true
 	haveImports := false
 	cursor := 0
 	firstPosition := 0
-	firstPosition = firstPosition
-	fset := token.NewFileSet()
-	node, err := parser.ParseFile(fset, file, nil, parser.ParseComments)
+	fileSet := token.NewFileSet()
+	node, err := parser.ParseFile(fileSet, file, nil, parser.ParseComments)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -74,19 +133,20 @@ func processFile(fileFolder, file string) {
 	var replacingBuffer []byte
 
 	for declIndex, decl := range node.Decls {
-		d1, ok := decl.(*ast.GenDecl)
+		genDecl, ok := decl.(*ast.GenDecl)
 		if !ok {
 			replacingBuffer = append(replacingBuffer, fileStream[cursor:(decl.End())]...)
 			cursor = int(decl.End())
 			continue
 		}
 
-		if d1.Tok == token.IMPORT {
+		if genDecl.Tok == token.IMPORT {
 			haveImports = true
-			tokenInfo.Start = int(d1.Pos())
-			tokenInfo.End = int(d1.End())
-			for _, spec := range d1.Specs {
+			tokenInfo.Start = int(genDecl.Pos())
+			tokenInfo.End = int(genDecl.End())
+			for _, spec := range genDecl.Specs {
 				astSpec := spec.(*ast.ImportSpec)
+				tokenInfo.Imports = append(tokenInfo.Imports, astSpec.Path.Value)
 				if astSpec.Path.Value == fmt.Sprintf("\"%s\"", appendContextTemplate) {
 					needImport = false
 				}
@@ -94,15 +154,24 @@ func processFile(fileFolder, file string) {
 			continue
 		}
 		if declIndex == 0 {
-			firstPosition = int(d1.Pos())
+			firstPosition = int(genDecl.Pos())
 		}
-		d2 := d1.Specs[0].(*ast.TypeSpec)
+		v := reflect.TypeOf(genDecl.Specs[0]).Elem()
+		switch v.Name() {
+		case "ValueSpec":
+			continue
+		case "TypeSpec":
+			break
+		default:
+			fmt.Println("unsupported type", v.Name())
+		}
+		typeSpec := genDecl.Specs[0].(*ast.TypeSpec)
 
-		d3, ok := d2.Type.(*ast.InterfaceType)
+		interfaceType, ok := typeSpec.Type.(*ast.InterfaceType)
 		if !ok {
 			continue
 		}
-		for i, t := range d3.Methods.List {
+		for i, t := range interfaceType.Methods.List {
 			if t.Names == nil {
 				continue
 			}
@@ -110,17 +179,23 @@ func processFile(fileFolder, file string) {
 			astInterfaceFunc := fName.Obj.Decl.(*ast.Field)
 			astInterfaceFuncParams := astInterfaceFunc.Type.(*ast.FuncType).Params.List
 			replacingBuffer = append(replacingBuffer, fileStream[cursor:(fName.End())]...)
-			cursor = int(fName.End())
 			if !FindContext(astInterfaceFuncParams) {
 				if needImport {
 					if haveImports {
-
+						tokenInfo.Imports = append(tokenInfo.Imports, appendContextTemplateWithComma)
+						sort.Strings(tokenInfo.Imports)
+						imports := strings.Join(tokenInfo.Imports, "\n\t")
+						formattedImport := fmt.Sprintf("import (\n\t%s\n)", imports)
+						var replacingBufferWithImport []byte
+						replacingBufferWithImport = append(replacingBufferWithImport, replacingBuffer[:tokenInfo.Start-1]...)
+						replacingBufferWithImport = append(replacingBufferWithImport, []byte(formattedImport)...)
+						replacingBufferWithImport = append(replacingBufferWithImport, replacingBuffer[tokenInfo.End:]...)
+						replacingBuffer = replacingBufferWithImport
 					} else {
 						var replacingBufferWithImport []byte
 						replacingBufferWithImport = append(replacingBufferWithImport, fileStream[:firstPosition-1]...)
 						lastPosition := len(replacingBufferWithImport)
 						replacingBufferWithImport = append(replacingBufferWithImport, []byte(importContextTemplateWithComma)...)
-						cursor += len(importContextTemplateWithComma)
 						replacingBufferWithImport = append(replacingBufferWithImport, replacingBuffer[lastPosition:]...)
 						replacingBuffer = replacingBufferWithImport
 					}
@@ -131,21 +206,18 @@ func processFile(fileFolder, file string) {
 					if len(astInterfaceFuncParams) > 0 {
 						replacingBuffer = append(replacingBuffer, comma, space)
 					}
-					cursor = int(fName.End())
-					if i == len(d3.Methods.List)-1 {
-						replacingBuffer = append(replacingBuffer, fileStream[cursor:(d3.End())]...)
+				} else {
+					replacingBuffer = append(replacingBuffer, []byte(template)...)
+					if len(astInterfaceFuncParams) > 0 {
+						replacingBuffer = append(replacingBuffer, comma, space)
 					}
-					continue
 				}
-				replacingBuffer = append(replacingBuffer, []byte(template)...)
-				if len(astInterfaceFuncParams) > 0 {
-					replacingBuffer = append(replacingBuffer, comma, space)
-				}
-				cursor = int(fName.End())
 			}
-			if i == len(d3.Methods.List)-1 {
-				replacingBuffer = append(replacingBuffer, fileStream[cursor:(d3.End())]...)
-				cursor = int(d3.End())
+			replacingBuffer = append(replacingBuffer, fileStream[fName.End():(t.End())]...)
+			cursor = int(t.End())
+			if i == len(interfaceType.Methods.List)-1 {
+				replacingBuffer = append(replacingBuffer, fileStream[cursor:(interfaceType.End())]...)
+				cursor = int(interfaceType.End())
 			}
 		}
 	}

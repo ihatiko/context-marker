@@ -47,6 +47,10 @@ type IService3 interface {
 	Test3(string)
 }
 
+type Test3 interface {
+	SomeFunc()
+}
+
 type Test2 struct {
 	Field1 int
 	Field2 int
